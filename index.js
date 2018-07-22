@@ -1,4 +1,3 @@
-const cheerio = require('cheerio');
 const rp = require('request-promise-native');
 
 var Service;
@@ -82,16 +81,26 @@ class ThinkEcoAPI {
   async auth() {
     if (Date.now() - this.lastLogin > LOGIN_FREQUENCY) {
       this.log('api', 'logging in...');
-      await this.session.post(
-        {uri: 'https://mymodlet.com/Account/Login',
-          form: {'loginForm.Email': this.username,
-            'loginForm.Password': this.password,
-            'loginForm.RememberMe': 'True',
-            'ReturnUrl': '/smartac'},
-          followRedirect: false,
-          simple: false});
+
+      await this.session.post({
+        uri: 'https://web.mymodlet.com/Account/Login',
+        body: {
+          // ThinkEco uses a strangely formatted payload:
+          // stringified JSON inside a 'data' JSON object.
+          data: JSON.stringify({
+            'Email': this.username,
+            'Password': this.password,
+          }),
+        },
+        followRedirect: false,
+        simple: false,
+        json: true,
+        jar: true,
+      });
+
       this.lastLogin = Date.now();
     }
+    this.log('api', 'loggged in...');
   }
 
   // return an iterable of all of the Thermostats in the account
@@ -107,23 +116,30 @@ class ThinkEcoAPI {
       this.log('api', 'updating thermostat status...');
       await this.auth();
       const statusTxt =
-       await this.session.post('https://mymodlet.com/SmartAC/UserSettingsTable');
+        await this.session.get('https://web.mymodlet.com/Devices/UpdateData');
 
-      // status is a quoted blob of HTML...
-      const status = JSON.parse('{"response":' + statusTxt + '}');
-      const $ = cheerio.load(status.response);
-      $('#appName').has('.drSetTemp').each((i, e) => {
-        const id = $('.drSetTemp', e).attr('id');
+      // statusTxt is a quoted string of JSON, e.g. "{\"SmartACs\": ... }"
+      let status = JSON.parse(JSON.parse(statusTxt));
+      status.SmartACs.forEach(ac => {
+        // Find the corresponding device for name.
+        const modletId = ac.modlet.modletId;
+        const device = status.Devices.find(item => item.modletId == modletId);
+        const id = device.deviceId;
+
         let thermostat = this.thermostats.get(id);
         if (!thermostat) {
           thermostat = new Thermostat(this, id);
           this.thermostats.set(id, thermostat);
         }
-        thermostat.name = $(e).children().first().text();
-        thermostat.targetTemp = parseInt($('option:checked', $(e).parent()).val());
-        thermostat.currentTemp = parseInt($('#currentTemperature', $(e).parent()).text());
-        thermostat.powerOn = $('#deviceAction', $(e).parent()).children('a').is('.Off');
+        //this.log('Devicename', 'logging in...');
+        thermostat.name = device.deviceName;
+       // thermostat.targetTemp = ac.thermostat.targetTemperature;
+       // thermostat.currentTemp = ac.thermostat.currentTemperature;
+        thermostat.powerOn = ac.modlet.isOn;
+        thermostat.modletOffline = ! ac.modlet.isOTA;
+        thermostat.thermostatOffline = !(ac.modlet.hasThermostat && ac.thermostat.thermostatIsOTA);
       });
+
       this.lastUpdate = Date.now();
     }
     this.lock.release();
@@ -134,16 +150,25 @@ class ThinkEcoAPI {
   // returns a boolean indicating if mymodlet.com told us if it was successful
   async pushUpdate(thermostat) {
     await this.auth();
-    const r = await this.session.post(
-      {uri: 'https://mymodlet.com/SmartAC/UserSettings',
-        body: {'applianceId': thermostat.id,
-          'targetTemperature': '' + thermostat.targetTemp,
-          'thermostated': thermostat.powerOn },
-        json: true });
-    return r.Success;
+    const r = await this.session.post({
+      uri: 'https://web.mymodlet.com/Devices/UserSettingsUpdate',
+      body: {
+        data: JSON.stringify({
+          'DeviceId': thermostat.id,
+        //  'TargetTemperature': String(thermostat.targetTemp),
+          'IsThermostated': thermostat.powerOn
+        }),
+      },
+      json: true
+    });
+
+    // Returned as a quoted string of JSON, so need to decode again...
+    const parsedResponse = JSON.parse(r);
+
+    return parsedResponse.data.status.IsError === false;
   }
 }
-
+/*
 function toC(fahrenheit) {
   return (fahrenheit - 32) * .5556;
 }
@@ -151,7 +176,7 @@ function toC(fahrenheit) {
 function toF(celsius) {
   return Math.round(celsius / .5556 + 32);
 }
-
+*/
 class Thermostat {
   constructor(api, id) {
     this.api = api;
@@ -162,25 +187,67 @@ class Thermostat {
     return this.api.pushUpdate(this);
   }
 
-  getCurrentHeatingCoolingState(callback) {
+  getActiveState(callback) {
     (async () => {
       await this.api.getThermostats();
-      this.api.log(this.name, 'heating / cooling state: ' + this.powerOn);
+
+      if (this.modletOffline) {
+        return callback(new Error('Modlet broken.'));
+      }
+
+      this.api.log(this.name, 'heating / cooling active: ' + this.powerOn);
+
       callback(null, this.powerOn ?
-        Characteristic.CurrentHeatingCoolingState.COOL :
-        Characteristic.CurrentHeatingCoolingState.OFF);
+        Characteristic.Active.ACTIVE:
+        Characteristic.Active.INACTIVE);
     })();
   }
 
-  setTargetHeatingCoolingState(value, callback) {
-    this.api.log(this.name, 'target heating / cooling state: ' + value);
-    this.powerOn = value === Characteristic.CurrentHeatingCoolingState.COOL;
-    this.update().then(() => callback(null, value));
+  setActiveState(value, callback) {
+    (async () => {
+      await this.api.getThermostats();
+
+      if (this.modletOffline) {
+        return callback(new Error('Modlet broken.'));
+      }
+
+      this.api.log(this.name, 'set heating / cooling active: ' + !this.powerOn);
+
+      this.powerOn = !this.powerOn;
+      this.update().then(() => callback());
+    })();
+  }
+/*
+  getCurrentHeaterCoolerState(callback) {
+    (async () => {
+      await this.api.getThermostats();
+
+      // Check if we're at our target temperature, so we can show
+      // the air conditioner as "idle" in the Home app.
+      var atTarget = toC(this.currentTemp) <= toC(this.targetTemp);
+
+      this.api.log(this.name, 'heating / cooling state: ' + atTarget);
+
+      callback(null, atTarget ?
+        Characteristic.CurrentHeaterCoolerState.IDLE:
+        Characteristic.CurrentHeaterCoolerState.COOLING);
+    })();
+  }
+
+  getTargetHeaterCoolerState(callback) {
+    callback(null, Characteristic.TargetHeaterCoolerState.COOL);
   }
 
   getCurrentTemperature(callback) {
     (async () => {
       await this.api.getThermostats();
+
+      if (this.thermostatOffline) {
+        // Passing an actual error here disables HomeKit controls,
+        // so using '0° F' to indicate thermostat offline.
+        return callback(null, toC(0));
+      }
+
       this.api.log(this.name, 'current temp: ' + this.currentTemp);
       callback(null, toC(this.currentTemp));
     })();
@@ -189,6 +256,11 @@ class Thermostat {
   getTargetTemperature(callback) {
     (async () => {
       await this.api.getThermostats();
+
+      if (this.modletOffline) {
+        return callback(new Error('Modlet broken.'));
+      }
+
       this.api.log(this.name, 'get target temp: ' + this.targetTemp);
       callback(null, toC(this.targetTemp));
     })();
@@ -200,47 +272,66 @@ class Thermostat {
     this.targetTemp = targetInF;
     this.update().then(() => callback(null, value));
   }
-
-  getTemperatureDisplayUnits(callback) {
-    this.api.log(this.name, 'temperature display units');
-    callback(null, Characteristic.TemperatureDisplayUnits.FAHRENHEIT);
-  }
-
+*/
   // homebridge calls this function to learn about the thermostat
+
+    getServices() {
+
+        var switchService = new Service.Switch(this.name);
+
+        switchService
+          //.getCharacteristic(Characteristic.On)
+          .getCharacteristic(Characteristic.Active)
+          .on('get', this.getActiveState.bind(this))
+          .on('set', this.getActiveState.bind(this));
+
+          const informationService = new Service.AccessoryInformation()
+            .setCharacteristic(Characteristic.Manufacturer, 'ThinkEco')
+            .setCharacteristic(Characteristic.Model, 'SmartAC')
+            .setCharacteristic(Characteristic.SerialNumber, 'Not Applicable');
+
+        return [informationService,switchService];
+
+    }
+/*
   getServices() {
-    const thermostatService = new Service.Thermostat(this.name);
+    const heaterCoolerService = new Service.HeaterCooler(this.name);
 
-    thermostatService
-      .getCharacteristic(Characteristic.CurrentHeatingCoolingState)
-      .on('get', this.getCurrentHeatingCoolingState.bind(this));
+    heaterCoolerService
+      .getCharacteristic(Characteristic.Active)
+      .on('get', this.getActiveState.bind(this))
+      .on('set', this.getActiveState.bind(this));
 
-    thermostatService
-      .getCharacteristic(Characteristic.TargetHeatingCoolingState)
-      .on('get', this.getCurrentHeatingCoolingState.bind(this))
-      .on('set', this.setTargetHeatingCoolingState.bind(this));
+    heaterCoolerService
+      .getCharacteristic(Characteristic.CurrentHeaterCoolerState)
+      .on('get', this.getCurrentHeaterCoolerState.bind(this));
+
+    heaterCoolerService
+      .getCharacteristic(Characteristic.TargetHeaterCoolerState)
+      .setProps({
+        // Only show options for cooling, since it's an A/C!
+        validValues: [Characteristic.TargetHeaterCoolerState.COOL]
+      })
+      .on('get', this.getTargetHeaterCoolerState.bind(this));
 
     // the next two characteristics work in celsius in the homekit api
     // min/max controls what the ios home app shows for the range of control
-    thermostatService
+    heaterCoolerService
       .getCharacteristic(Characteristic.CurrentTemperature)
-      .setProps({ minValue: 5, maxValue: 40, minStep: 0.1})
+      .setProps({ minValue: -100, maxValue: 100, minStep: 0.1})
       .on('get', this.getCurrentTemperature.bind(this));
 
-    thermostatService
-      .getCharacteristic(Characteristic.TargetTemperature)
+    heaterCoolerService
+      .getCharacteristic(Characteristic.CoolingThresholdTemperature)
       .setProps({ minValue: 15, maxValue: 33, minStep: 0.1})
       .on('get', this.getTargetTemperature.bind(this))
       .on('set', this.setTargetTemperature.bind(this));
-
-    thermostatService
-      .getCharacteristic(Characteristic.TemperatureDisplayUnits)
-      .on('get', this.getTemperatureDisplayUnits.bind(this));
 
     const informationService = new Service.AccessoryInformation()
       .setCharacteristic(Characteristic.Manufacturer, 'ThinkEco')
       .setCharacteristic(Characteristic.Model, 'SmartAC')
       .setCharacteristic(Characteristic.SerialNumber, 'Not Applicable');
 
-    return [informationService, thermostatService];
-  }
+    return [informationService, heaterCoolerService];
+  }*/
 }
