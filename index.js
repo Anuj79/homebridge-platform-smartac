@@ -117,7 +117,7 @@ class ThinkEcoAPI {
       await this.auth();
       const statusTxt =
         await this.session.get('https://web.mymodlet.com/Devices/UpdateData');
-
+        //this.log(statusTxt);
       // statusTxt is a quoted string of JSON, e.g. "{\"SmartACs\": ... }"
       let status = JSON.parse(JSON.parse(statusTxt));
       status.SmartACs.forEach(ac => {
@@ -150,22 +150,46 @@ class ThinkEcoAPI {
   // returns a boolean indicating if mymodlet.com told us if it was successful
   async pushUpdate(thermostat) {
     await this.auth();
+
+    //this.log(' powerOn status:' + thermostat.powerOn);
+    if (thermostat.powerOn) {
+    /*  this.log(' powerOn status in if :' + thermostat.powerOn + ' ' + JSON.stringify({
+        'id':new String (thermostat.id)
+      }) );*/
+      const r = await this.session.post({
+        uri: 'https://web.mymodlet.com/Devices/SwitchOn',
+        body: {
+          data: JSON.stringify({
+            'id': new String (thermostat.id)
+          }),
+        },
+        json: true
+      });
+      const parsedResponse = JSON.parse(r);
+    //  this.log('after update r ' + r );
+    //  return parsedResponse.data.status.IsError === false;
+       }
+  else {
+  /*  this.log(' powerOn status in else :' + thermostat.powerOn + ' ' + JSON.stringify({
+      'id':new String (thermostat.id)
+    }) );*/
     const r = await this.session.post({
-      uri: 'https://web.mymodlet.com/Devices/UserSettingsUpdate',
+      uri: 'https://web.mymodlet.com/Devices/SwitchOff',
       body: {
         data: JSON.stringify({
-          'DeviceId': thermostat.id,
-        //  'TargetTemperature': String(thermostat.targetTemp),
-          'IsThermostated': thermostat.powerOn
+          'id':new String (thermostat.id)
         }),
       },
       json: true
     });
-
-    // Returned as a quoted string of JSON, so need to decode again...
     const parsedResponse = JSON.parse(r);
+  //  this.log('after update else r ' + r );
+    //return parsedResponse.data.status.IsError === false;
+      }
 
-    return parsedResponse.data.status.IsError === false;
+  //  this.log( 'after update deviceID :' + thermostat.id + 'isPoweredOn :' + thermostat.powerOn );
+    // Returned as a quoted string of JSON, so need to decode again...
+
   }
 }
 /*
@@ -195,7 +219,7 @@ class Thermostat {
         return callback(new Error('Modlet broken.'));
       }
 
-      this.api.log(this.name, 'heating / cooling active: ' + this.powerOn);
+      this.api.log(this.name, ' modlet current status : ' + this.powerOn);
 
       callback(null, this.powerOn ?
         Characteristic.Active.ACTIVE:
@@ -211,7 +235,7 @@ class Thermostat {
         return callback(new Error('Modlet broken.'));
       }
 
-      this.api.log(this.name, 'set heating / cooling active: ' + !this.powerOn);
+      this.api.log(this.name, 'Modlet setting status: ' + !this.powerOn);
 
       this.powerOn = !this.powerOn;
       this.update().then(() => callback());
@@ -280,10 +304,10 @@ class Thermostat {
         var switchService = new Service.Switch(this.name);
 
         switchService
-          //.getCharacteristic(Characteristic.On)
-          .getCharacteristic(Characteristic.Active)
+         .getCharacteristic(Characteristic.On)
+        //  .getCharacteristic(Characteristic.Active)
           .on('get', this.getActiveState.bind(this))
-          .on('set', this.getActiveState.bind(this));
+          .on('set', this.setActiveState.bind(this));
 
           const informationService = new Service.AccessoryInformation()
             .setCharacteristic(Characteristic.Manufacturer, 'ThinkEco')
